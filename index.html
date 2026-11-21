@@ -1,0 +1,1559 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>디자인 제작물 접수 및 시안 피드백</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React 18 & Babel CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    .cursor-crosshair { cursor: crosshair; }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800 antialiased selection:bg-blue-600 selection:text-white">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    // 구글 Apps Script 웹앱(백엔드) 호출. 권한 검사는 모두 서버(Apps Script)에서 다시 합니다.
+    const API_URL = 'https://script.google.com/macros/s/AKfycby25keEjsRK3opIDdwY_M03LSDJv7xQu5TFi_vSSHCiWszzKytfPiIP6h7Hr6_pO0KgWg/exec';
+    let sessionToken = '';
+    async function gasCall(request) {
+      let response;
+      try {
+        response = await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(request)
+        });
+      } catch (e) {
+        throw new Error('서버에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.');
+      }
+      if (!response.ok) throw new Error('서버 응답 오류(' + response.status + ')입니다. 잠시 후 다시 시도해 주세요.');
+      try { return await response.json(); }
+      catch (e) { throw new Error('서버 응답을 읽을 수 없습니다. 잠시 후 다시 시도해 주세요.'); }
+    }
+    async function api(path,opts={}) {
+      const method=opts.method||'GET';
+      let body=opts.body;
+      if (typeof body==='string') body=JSON.parse(body);
+      const reply=await gasCall({path,method,body:body||{},token:sessionToken});
+      if(!reply?.ok) throw new Error(reply?.error||'요청 처리에 실패했습니다.');
+      if(path==='/session')sessionToken=reply.data.token;
+      return reply.data;
+    }
+    function readAsBase64(file) {
+      return new Promise((resolve,reject)=>{
+        const reader=new FileReader();
+        reader.onload=()=>resolve(String(reader.result).split(',')[1]);
+        reader.onerror=()=>reject(new Error('파일을 읽을 수 없습니다.'));
+        reader.readAsDataURL(file);
+      });
+    }
+    async function storeLocalFile(file) {
+      const limit=5*1024*1024;
+      if(file.size>limit)throw new Error('파일은 5MB 이하만 업로드할 수 있습니다. 큰 파일은 별도 전달하세요.');
+      return api('/files',{method:'POST',body:{name:file.name,mime:file.type||'application/octet-stream',size:file.size,base64:await readAsBase64(file)}});
+    }
+    async function fetchFileData(file) {
+      if(!file?.id)throw new Error('저장된 파일이 없습니다.');
+      return api('/files/'+encodeURIComponent(file.id));
+    }
+    async function downloadLocalFile(file) {
+      try {
+        const item=await fetchFileData(file);
+        const binary=atob(item.base64);
+        const bytes=new Uint8Array(binary.length);
+        for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+        const url=URL.createObjectURL(new Blob([bytes],{type:item.mime||'application/octet-stream'}));
+        const a=document.createElement('a');a.href=url;a.download=item.name||file.name||'첨부파일';a.click();
+        setTimeout(()=>URL.revokeObjectURL(url),1000);
+      } catch(e){alert('파일 다운로드 실패: '+e.message);}
+    }
+    function FileLinks({files=[]}) {
+      return <div className="space-y-1">{files.map((f,i)=><button key={f.id||i} type="button" onClick={()=>downloadLocalFile(f)} className="block text-blue-600 underline text-left">📎 {f.name} ({f.size||''}) 다운로드</button>)}</div>;
+    }
+
+    // ==========================================
+    // 1. 택배사 및 상태 매핑 상수
+    // ==========================================
+    const COURIERS = [
+      { code: 'CJ_LOGISTICS', name: 'CJ대한통운', url: 'https://www.cjlogistics.com/ko/tool/parcel/tracking?gnbInvcNo=' },
+      { code: 'LOTTE', name: '롯데택배', url: 'https://www.lotteglogis.com/home/reservation/tracking/linkView?InvNo=' },
+      { code: 'HANJIN', name: '한진택배', url: 'https://www.hanjin.com/kor/CMS/DeliveryMgr/WaybillResult.do?mCode=MN038&wblnum=' },
+      { code: 'POST', name: '우체국택배', url: 'https://service.epost.go.kr/trace.RetrieveDomRcvTraceList.comm?sid1=' },
+      { code: 'QUICK', name: '퀵서비스 / 직배송', url: '' },
+      { code: 'PICKUP', name: '충무로 / 성진애드컴 방문수령', url: '' },
+    ];
+
+    const STATUS_MAP = {
+      SUBMITTED: { label: '접수대기', badge: 'bg-amber-100 text-amber-800 border-amber-300' },
+      IN_PROGRESS: { label: '디자인작업중', badge: 'bg-blue-100 text-blue-800 border-blue-300' },
+      REVIEW_REQUESTED: { label: '시안확인요청(검토대기)', badge: 'bg-purple-100 text-purple-800 border-purple-300 ring-2 ring-purple-400/30 font-bold' },
+      REVISION_NEEDED: { label: '수정요청(반려)', badge: 'bg-rose-100 text-rose-800 border-rose-300' },
+      APPROVED: { label: '최종승인완료', badge: 'bg-emerald-100 text-emerald-800 border-emerald-300' },
+      READY_TO_PRINT: { label: '발주준비완료', badge: 'bg-cyan-100 text-cyan-800 border-cyan-300' },
+      SHIPPED: { label: '출고/배송완료', badge: 'bg-slate-100 text-slate-800 border-slate-300' },
+    };
+
+    // ==========================================
+    // 2. 디티피아(성진애드컴) 텍스트 명세서 생성 유틸
+    // ==========================================
+    function generateDtpiaSpecText(order) {
+      const { orderNumber, itemType, requesterName, department, contact, specs, dueDate, shippingAddress } = order;
+      let formBody = '';
+
+      if (itemType === 'BUSINESS_CARD') {
+        formBody = `
+[${department || '단체명 미입력'} 주문 입력 가이드]
+------------------------------------------------------------
+1. 품목 분류   : 명함 > 일반지/고급지 명함
+2. 규격 선택   : 표준 규격 (재단 90×50mm / 작업 92×52mm)
+3. 지종/평량   : 랑데뷰 울트라화이트 240g
+4. 인쇄 도수   : 양면 칼라 8도
+5. 후가공 선택 : 귀도리 (모서리 라운딩)
+6. 주문 수량   : 건수 1건 / 각 ${specs?.수량 || '300매'}
+7. 인쇄 명단   : ${requesterName}
+------------------------------------------------------------`;
+      } else {
+        formBody = `
+[${department || '단체명 미입력'} 주문 입력 가이드]
+------------------------------------------------------------
+1. 품목 분류   : ${order.itemTypeName || itemType}
+2. 제작 사양   : ${order.summarySpecs || ''}
+3. 납기 희망   : ${dueDate || '최대한 빠른 출고'}
+------------------------------------------------------------`;
+      }
+
+      return `============================================================
+[${department || '단체명 미입력'} 발주사양서]
+주문 관리 번호 : ${orderNumber}
+발주 등록 일자 : ${new Date().toISOString().split('T')[0]}
+출고 희망 기한 : ${dueDate || '최대한 빠른 출고'}
+============================================================
+${formBody}
+
+[배송 및 출고 정보]
+- 수령 방법   : ${order.deliveryMethod || '택배'}
+- 받으실 분   : ${order.recipientName || requesterName} (${department || '사내 의뢰'})
+- 연락처     : ${order.recipientPhone || contact}
+- 배송지 주소 : ${shippingAddress || '본사 사옥'}
+============================================================
+`;
+    }
+
+    // ==========================================
+    // 3. 초기 더미 데이터
+    // ==========================================
+    const DEFAULT_ORDERS = [
+      {
+        id: 'ord-1',
+        orderNumber: '261102-브랜드마케팅팀',
+        password: '1234',
+        requesterName: '김지현 대리',
+        department: '브랜드마케팅팀',
+        contact: '010-3344-7788',
+        itemType: 'LEAFLET',
+        itemTypeName: '리플릿',
+        summarySpecs: '크기 A4 / 수량 1,000부 / 칼라 / 양면 / 3단접지',
+        dueDate: '2026-11-06',
+        requestNotes: '브랜드 리뉴얼에 맞춰 신뢰감을 주는 블루 계열로 진행 부탁드립니다.',
+        contentNotes: 'NEXT GENERATION\n2026 차세대 비즈니스 리플릿 본문...',
+        shippingAddress: '서울 중구 퇴계로86가길 5 3층',
+        deliveryMethod: '택배',
+        recipientName: '김지현',
+        recipientPhone: '010-3344-7788',
+        status: 'REVIEW_REQUESTED',
+        specs: { 크기: 'A4', 수량: '1,000부', 색상: '칼라', 인쇄면: '양면' },
+        rawFiles: [{ name: '2026_신제품_홍보원고.docx', size: '2.4MB' }],
+        printHandoff: null,
+        drafts: [
+          {
+            version: 1,
+            fileName: 'leaflet_v1_초안.svg',
+            imageType: 'svg_leaflet_v1',
+            imageUrl: '',
+            designerNote: '표지 메인 헤드라인을 볼드하게 잡고 3단 그리드로 초안 배치했습니다.',
+            uploadedAt: '11:20',
+            uploadedBy: '이디자이너',
+            pins: [
+              { id: 'p-1', xPercent: 24, yPercent: 32, comment: '영문 슬로건 폰트 크기를 조금 더 키워주세요.', author: '김지현 대리', createdAt: '11:45' }
+            ]
+          },
+          {
+            version: 2,
+            fileName: 'leaflet_v2_수정본.svg',
+            imageType: 'svg_leaflet_v2',
+            imageUrl: '',
+            designerNote: '요청 주신 표지 폰트 및 2페이지 핵심 색상을 브랜드 블루로 톤업했습니다.',
+            uploadedAt: '15:10',
+            uploadedBy: '이디자이너',
+            pins: []
+          }
+        ],
+        comments: [
+          { id: 'c-1', author: '이디자이너', role: 'DESIGNER', content: '1차 시안 업로드했습니다. 표지 카피 확인 부탁드립니다.', time: '11:22' },
+          { id: 'c-2', author: '김지현 대리', role: 'REQUESTER', content: '2페이지 본문 컬러를 브랜드 블루로 수정해 주세요!', time: '13:05' }
+        ],
+        productionStatus: 'ORDER_CONFIRMED',
+        courierCode: 'CJ_LOGISTICS',
+        trackingNumber: '682194012345',
+        shippedAt: '',
+        isNotificationSent: false
+      }
+    ];
+
+    // ==========================================
+    // 4. 시안 그래픽 렌더러
+    // ==========================================
+    function RenderDraftGraphic({ draft }) {
+      const [localUrl, setLocalUrl] = useState('');
+      useEffect(()=>{
+        setLocalUrl('');
+        if(!draft?.storedFile?.id)return;
+        let active=true;let objectUrl='';
+        fetchFileData(draft.storedFile).then(f=>{
+          if(!active)return;
+          if(!String(f.mime||'').startsWith('image/'))return;
+          const binary=atob(f.base64),bytes=new Uint8Array(binary.length);
+          for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+          objectUrl=URL.createObjectURL(new Blob([bytes],{type:f.mime}));setLocalUrl(objectUrl);
+        }).catch(()=>setLocalUrl(''));
+        return ()=>{active=false;if(objectUrl)URL.revokeObjectURL(objectUrl);};
+      },[draft?.storedFile?.id]);
+      if (!draft) return null;
+      if (localUrl || draft.imageUrl) {
+        return (
+          <div className="w-full flex items-center justify-center bg-slate-900/5 p-2 rounded-lg">
+            <img src={localUrl || draft.imageUrl} alt={draft.fileName} className="max-h-[500px] w-auto object-contain select-none shadow-md rounded" />
+          </div>
+        );
+      }
+      if (draft.imageType === 'svg_leaflet_v2') {
+        return (
+          <svg viewBox="0 0 800 480" className="w-full h-auto select-none rounded shadow-sm border bg-slate-50">
+            <rect width="800" height="480" fill="#f8fafc" />
+            <line x1="266" y1="0" x2="266" y2="480" stroke="#cbd5e1" strokeWidth="2" strokeDasharray="6 6" />
+            <line x1="533" y1="0" x2="533" y2="480" stroke="#cbd5e1" strokeWidth="2" strokeDasharray="6 6" />
+            <text x="133" y="36" textAnchor="middle" fill="#64748b" fontSize="13" fontWeight="bold">[1면] 기업 개요</text>
+            <text x="400" y="36" textAnchor="middle" fill="#2563eb" fontSize="13" fontWeight="bold">[2면] 브랜드 블루 컬러 반영 (v2)</text>
+            <text x="666" y="36" textAnchor="middle" fill="#2563eb" fontSize="14" fontWeight="bold">[3면 표지] 폰트 확대 (v2 최신)</text>
+            <rect x="40" y="70" width="186" height="110" rx="6" fill="#e2e8f0" />
+            <rect x="306" y="70" width="186" height="80" rx="6" fill="#2563eb" />
+            <text x="399" y="115" textAnchor="middle" fill="#ffffff" fontSize="14" fontWeight="bold">브랜드 블루 #0055FF</text>
+            <circle cx="666" cy="130" r="42" fill="#2563eb" />
+            <text x="666" y="210" textAnchor="middle" fill="#1e293b" fontSize="22" fontWeight="900">NEXT GENERATION</text>
+            <text x="666" y="238" textAnchor="middle" fill="#2563eb" fontSize="14" fontWeight="bold">2026 차세대 비즈니스 리플릿</text>
+          </svg>
+        );
+      }
+      return (
+        <svg viewBox="0 0 800 480" className="w-full h-auto select-none rounded shadow-sm border bg-slate-50">
+          <rect width="800" height="480" fill="#f8fafc" />
+          <line x1="266" y1="0" x2="266" y2="480" stroke="#cbd5e1" strokeWidth="2" strokeDasharray="6 6" />
+          <line x1="533" y1="0" x2="533" y2="480" stroke="#cbd5e1" strokeWidth="2" strokeDasharray="6 6" />
+          <text x="133" y="36" textAnchor="middle" fill="#94a3b8" fontSize="13" fontWeight="bold">[1면] 기업 개요</text>
+          <text x="400" y="36" textAnchor="middle" fill="#94a3b8" fontSize="13" fontWeight="bold">[2면] 세부 사양 (초안 그레이)</text>
+          <text x="666" y="36" textAnchor="middle" fill="#2563eb" fontSize="14" fontWeight="bold">[3면 표지] 메인 타이틀 (v1)</text>
+          <rect x="40" y="70" width="186" height="110" rx="6" fill="#e2e8f0" />
+          <rect x="306" y="70" width="186" height="80" rx="6" fill="#94a3b8" />
+          <text x="399" y="115" textAnchor="middle" fill="#ffffff" fontSize="13" fontWeight="bold">기존 그레이 영역</text>
+          <circle cx="666" cy="130" r="42" fill="#3b82f6" opacity="0.8" />
+          <text x="666" y="210" textAnchor="middle" fill="#1e293b" fontSize="18" fontWeight="bold">NEXT GENERATION</text>
+          <text x="666" y="235" textAnchor="middle" fill="#64748b" fontSize="12">2026 차세대 비즈니스 리플릿</text>
+        </svg>
+      );
+    }
+
+    // ==========================================
+    // 5. 최상위 메인 컨트롤러 (App)
+    // ==========================================
+    function App() {
+      const [orders, setOrders] = useState([]);
+      const [ready, setReady] = useState(false);
+      const [serverError, setServerError] = useState('');
+      useEffect(()=>{
+        (async()=>{
+          try{
+            const sess=await api('/session'); csrf=sess.csrf;
+            const items=await api('/orders');setOrders(items);
+            setIsDesignerAuthenticated(sess.designer);
+            setReady(true);
+          }catch(err){setServerError(err.message);}
+        })();
+      },[]);
+      const refreshOrders=async()=>{
+        const items=await api('/orders');setOrders(items);return items;
+      };
+      const saveOrder=async updated=>{
+        try{
+          const saved=await api('/orders/'+encodeURIComponent(updated.id),{method:'PUT',body:updated});
+          setOrders(prev=>prev.map(o=>o.id===saved.id?saved:o));
+        }catch(err){alert('저장되지 않았습니다: '+err.message);}
+      };
+
+      const [currentTab, setCurrentTab] = useState('BOARD'); // 'BOARD' | 'DESIGNER' | 'REVIEW' | 'REQUEST'
+      const [activeOrderId, setActiveOrderId] = useState(null);
+      const [toastMessage, setToastMessage] = useState('');
+
+      // 암호 모달 상태
+      const [passwordModalOrder, setPasswordModalOrder] = useState(null);
+      const [passwordInput, setPasswordInput] = useState('');
+      const [passwordError, setPasswordError] = useState('');
+
+      // 디자이너 전용 암호 상태
+      const [isDesignerAuthenticated, setIsDesignerAuthenticated] = useState(false);
+      const [authorizedReviewId, setAuthorizedReviewId] = useState(null);
+      const [showDesignerAuthModal, setShowDesignerAuthModal] = useState(false);
+      const [designerAuthInput, setDesignerAuthInput] = useState('');
+      const [designerAuthError, setDesignerAuthError] = useState('');
+
+      // 디자이너 암호 변경 모달
+      const [showChangePwdModal, setShowChangePwdModal] = useState(false);
+      const [currentPwdInput, setCurrentPwdInput] = useState('');
+      const [newPwdInput, setNewPwdInput] = useState('');
+      const [confirmNewPwdInput, setConfirmNewPwdInput] = useState('');
+      const [changePwdError, setChangePwdError] = useState('');
+
+      // 삭제 모달
+      const [deleteTargetOrder, setDeleteTargetOrder] = useState(null);
+
+      const triggerToast = (msg) => {
+        setToastMessage(msg);
+        setTimeout(() => setToastMessage(''), 3500);
+      };
+
+      const selectedOrder = orders.find((o) => o.id === activeOrderId) || (isDesignerAuthenticated ? orders[0] : null);
+
+      const handleEnterDesignerMode = () => {
+        if (isDesignerAuthenticated) {
+          setCurrentTab('DESIGNER');
+        } else {
+          setDesignerAuthInput('');
+          setDesignerAuthError('');
+          setShowDesignerAuthModal(true);
+        }
+      };
+
+      const handleVerifyDesignerPassword = async e => {
+        e.preventDefault();
+        try{
+          await api('/designer/login',{method:'POST',body:{password:designerAuthInput}});
+          setIsDesignerAuthenticated(true);setShowDesignerAuthModal(false);
+          await refreshOrders();setCurrentTab('DESIGNER');triggerToast('디자이너 인증 완료');
+        }catch(err){setDesignerAuthError(err.message);}
+      };
+      const handleChangeDesignerPassword = async e => {
+        e.preventDefault();
+        if(newPwdInput!==confirmNewPwdInput){setChangePwdError('새 암호가 일치하지 않습니다.');return;}
+        try{
+          await api('/designer/password',{method:'POST',body:{current:currentPwdInput,new:newPwdInput}});
+          setShowChangePwdModal(false);setCurrentPwdInput('');setNewPwdInput('');setConfirmNewPwdInput('');triggerToast('암호 변경 완료');
+        }catch(err){setChangePwdError(err.message);}
+      };
+      const handleVerifyPassword = async e => {
+        e.preventDefault();if(!passwordModalOrder)return;
+        try{
+          const detail=await api('/orders/'+encodeURIComponent(passwordModalOrder.id)+'/unlock',{method:'POST',body:{password:passwordInput}});
+          setOrders(old=>old.map(o=>o.id===detail.id?detail:o));
+          setActiveOrderId(detail.id);setAuthorizedReviewId(detail.id);
+          setPasswordModalOrder(null);setPasswordInput('');setCurrentTab('REVIEW');
+        }catch(err){setPasswordError(err.message);}
+      };
+
+      const handleConfirmDelete = async () => {
+        if(!deleteTargetOrder)return;
+        try{
+          await api('/orders/'+encodeURIComponent(deleteTargetOrder.id),{method:'DELETE'});
+          await refreshOrders();setActiveOrderId(null);setDeleteTargetOrder(null);
+          setAuthorizedReviewId(null);setCurrentTab('BOARD');triggerToast('주문 삭제 완료');
+        }catch(err){alert('삭제 실패: '+err.message);}
+      };
+
+      // 디자이너 전용: 모든 상태(완료 포함)의 주문 목록을 엑셀 호환 CSV로 내보낸다.
+      const downloadAllOrdersCsv = () => {
+        if (!isDesignerAuthenticated) { triggerToast('디자이너 인증이 필요합니다.'); return; }
+        if (!orders.length) { triggerToast('다운로드할 주문이 없습니다.'); return; }
+        const fields = [
+          ['접수번호', o => o.orderNumber], ['접수일', o => o.createdAt || o.orderNumber?.slice(0,6) || ''],
+          ['단체명', o => o.department], ['신청자', o => o.requesterName], ['연락처', o => o.contact],
+          ['품목', o => o.itemTypeName], ['세부 사양 요약', o => o.summarySpecs],
+          ['세부 사양 전체', o => JSON.stringify(o.specs || {})], ['완료 희망일', o => o.dueDate],
+          ['진행 상태', o => STATUS_MAP[o.status]?.label || o.status],
+          ['디자인 요청사항', o => o.requestNotes], ['원고 텍스트', o => o.contentNotes],
+          ['원고 첨부파일', o => (o.rawFiles || []).map(f => f.name).join(' / ')],
+          ['수령 방법', o => o.deliveryMethod], ['수령자 이름', o => o.recipientName],
+          ['수령자 전화번호', o => o.recipientPhone], ['배송지', o => o.shippingAddress],
+          ['디자이너', o => o.printHandoff?.designerName], ['인쇄소', o => o.printHandoff?.printShop],
+          ['인쇄 방법', o => o.printHandoff?.method], ['출고 예정일', o => o.printHandoff?.expectedDate],
+          ['인쇄용 파일명', o => o.printHandoff?.storedPrintFile?.name || o.printHandoff?.fileName],
+          ['인쇄 메모', o => o.printHandoff?.memo],
+          ['시안 수', o => (o.drafts || []).length],
+          ['최신 시안 파일', o => (o.drafts || []).at(-1)?.fileName || ''],
+          ['시안 파일 목록', o => (o.drafts || []).map(d => `v${d.version}: ${d.fileName}`).join(' / ')],
+          ['시안 메모', o => (o.drafts || []).map(d => `v${d.version}: ${d.designerNote || ''}`).join(' / ')],
+          ['승인 시안 버전', o => o.approvedDraftVersion || o.approvedVersion || ''],
+          ['제작 상태', o => o.productionStatus], ['택배사', o => COURIERS.find(c => c.code === o.courierCode)?.name || o.courierCode],
+          ['송장번호', o => o.trackingNumber], ['출고일', o => o.shippedAt],
+          ['의견·수정 요청 내역', o => (o.comments || []).map(c => `[${c.time || ''}] ${c.author || ''}: ${c.content || ''}`).join(' | ')],
+          ['디자이너 수정 이력', o => (o.adminEditHistory || []).map(h => `${h.at || ''}: ${h.message || ''}`).join(' | ')]
+        ];
+        // Excel 수식 주입 방지 및 RFC 4180 스타일 이스케이프
+        const cell = v => {
+          let t = String(v ?? '');
+          if (/^[\s\u0000-\u001f]*[=+@-]/.test(t)) t = "'" + t;
+          return '"' + t.replace(/"/g, '""') + '"';
+        };
+        const csv = '\uFEFF' + [fields.map(f => cell(f[0])).join(','), ...orders.map(o => fields.map(f => cell(f[1](o))).join(','))].join('\r\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `DM_전체접수내역_${new Date().toLocaleDateString('sv-SE')}.csv`;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        triggerToast(`전체 ${orders.length}건의 주문 내역을 내려받았습니다.`);
+      };
+
+      const downloadSpecFile = (order) => {
+        const text = generateDtpiaSpecText(order);
+        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${order.orderNumber}_발주사양서.txt`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        triggerToast('사양서.txt 다운로드 완료!');
+      };
+
+      return (
+        <div className="min-h-screen bg-slate-100 flex flex-col font-sans pb-24">
+          {!ready && <div className="p-5 bg-white border">{serverError ? '서버 연결 오류: '+serverError : '서버 데이터 불러오는 중...'}</div>}
+          {/* 의뢰 삭제 모달 */}
+          {deleteTargetOrder && (
+            <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl max-w-sm w-full p-6 space-y-4 shadow-2xl border border-rose-200">
+                <div className="text-center">
+                  <div className="w-12 h-12 bg-rose-100 text-rose-600 rounded-2xl flex items-center justify-center text-xl mx-auto mb-2 font-bold">🗑️</div>
+                  <h3 className="font-extrabold text-base text-slate-900">디자인 의뢰 삭제</h3>
+                  <p className="text-xs text-slate-600 mt-1">[{deleteTargetOrder.orderNumber}] 의뢰를 삭제하시겠습니까?</p>
+                </div>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => setDeleteTargetOrder(null)} className="flex-1 py-2 bg-slate-100 text-slate-700 rounded-xl font-bold text-xs">취소</button>
+                  <button type="button" onClick={handleConfirmDelete} className="flex-1 py-2 bg-rose-600 text-white rounded-xl font-bold text-xs">삭제하기</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 디자이너 암호 인증 모달 */}
+          {showDesignerAuthModal && (
+            <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl max-w-sm w-full p-6 space-y-4 shadow-2xl border">
+                <div className="text-center">
+                  <div className="w-12 h-12 bg-slate-900 text-white rounded-2xl flex items-center justify-center text-xl mx-auto mb-2 font-bold">🎨</div>
+                  <h3 className="font-extrabold text-base text-slate-900">디자이너 전용 모드</h3>
+                  <p className="text-xs text-slate-500 mt-1">공통 암호를 입력하세요.</p>
+                </div>
+                <form onSubmit={handleVerifyDesignerPassword} className="space-y-3">
+                  <input
+                    type="password"
+                    autoFocus
+                    placeholder="디자이너 암호 입력"
+                    value={designerAuthInput}
+                    onChange={(e) => { setDesignerAuthInput(e.target.value); setDesignerAuthError(''); }}
+                    className="w-full border rounded-xl px-3 py-2.5 text-center text-sm font-bold bg-slate-50"
+                  />
+                  {designerAuthError && <p className="text-rose-500 text-xs text-center font-bold">{designerAuthError}</p>}
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => setShowDesignerAuthModal(false)} className="flex-1 py-2 bg-slate-100 rounded-xl text-xs font-bold">취소</button>
+                    <button type="submit" className="flex-1 py-2 bg-slate-900 text-white rounded-xl text-xs font-bold">입장</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* 디자이너 암호 변경 모달 */}
+          {showChangePwdModal && (
+            <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl max-w-sm w-full p-6 space-y-4 shadow-2xl border text-xs">
+                <h3 className="font-extrabold text-sm text-slate-900 border-b pb-2">⚙️ 디자이너 암호 변경</h3>
+                <form onSubmit={handleChangeDesignerPassword} className="space-y-3">
+                  <div>
+                    <label className="block font-bold mb-1">현재 암호</label>
+                    <input type="password" required value={currentPwdInput} onChange={(e) => setCurrentPwdInput(e.target.value)} className="w-full border rounded-xl p-2 bg-slate-50" />
+                  </div>
+                  <div>
+                    <label className="block font-bold mb-1">새 암호 (12자리 이상)</label>
+                    <input type="password" required value={newPwdInput} onChange={(e) => setNewPwdInput(e.target.value)} className="w-full border rounded-xl p-2 bg-slate-50" />
+                  </div>
+                  <div>
+                    <label className="block font-bold mb-1">새 암호 확인</label>
+                    <input type="password" required value={confirmNewPwdInput} onChange={(e) => setConfirmNewPwdInput(e.target.value)} className="w-full border rounded-xl p-2 bg-slate-50" />
+                  </div>
+                  {changePwdError && <p className="text-rose-500 font-bold text-center">{changePwdError}</p>}
+                  <div className="flex gap-2 pt-1">
+                    <button type="button" onClick={() => setShowChangePwdModal(false)} className="flex-1 py-2 bg-slate-100 rounded-xl font-bold">취소</button>
+                    <button type="submit" className="flex-1 py-2 bg-blue-600 text-white rounded-xl font-bold">변경 저장</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* 접수자 시안 확인 암호 모달 */}
+          {passwordModalOrder && (
+            <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl max-w-sm w-full p-6 space-y-4 shadow-2xl border">
+                <div className="text-center">
+                  <div className="w-12 h-12 bg-purple-100 text-purple-700 rounded-2xl flex items-center justify-center text-xl mx-auto mb-2 font-bold">🔒</div>
+                  <h3 className="font-extrabold text-base text-slate-900">의뢰 내역 확인 암호 입력</h3>
+                  <p className="text-xs text-slate-500 mt-1">접수 시 설정한 암호를 입력하세요.</p>
+                </div>
+                <form onSubmit={handleVerifyPassword} className="space-y-3">
+                  <input
+                    type="password"
+                    autoFocus
+                    placeholder="암호 입력"
+                    value={passwordInput}
+                    onChange={(e) => { setPasswordInput(e.target.value); setPasswordError(''); }}
+                    className="w-full border rounded-xl px-3 py-2.5 text-center text-sm font-bold bg-slate-50"
+                  />
+                  {passwordError && <p className="text-rose-500 text-xs text-center font-bold">{passwordError}</p>}
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => setPasswordModalOrder(null)} className="flex-1 py-2 bg-slate-100 rounded-xl text-xs font-bold">취소</button>
+                    <button type="submit" className="flex-1 py-2 bg-purple-600 text-white rounded-xl text-xs font-bold">확인</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* 토스트 */}
+          {toastMessage && (
+            <div className="fixed bottom-24 right-6 z-50 bg-slate-900 text-white text-xs px-4 py-3 rounded-xl shadow-xl flex items-center gap-2">
+              <span className="text-emerald-400 font-bold">✓</span> {toastMessage}
+            </div>
+          )}
+
+          {/* 상단 헤더 */}
+          <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-xs">
+            <div className="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
+              <div className="flex items-center gap-2 cursor-pointer" onClick={() => setCurrentTab('BOARD')}>
+                <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center text-white font-black">P</div>
+                <div>
+                  <h1 className="font-extrabold text-base text-slate-900">사내 인쇄 접수 시스템</h1>
+                  <p className="text-[11px] text-slate-400">로컬 테스트 전용 · 파일과 주문은 이 브라우저에만 보관됨</p>
+                </div>
+              </div>
+              <div className="flex gap-1.5 text-xs font-bold">
+                <button onClick={() => setCurrentTab('BOARD')} className={`px-3 py-1.5 rounded-lg transition ${currentTab === 'BOARD' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600'}`}>📋 접수 목록</button>
+                <button onClick={() => setCurrentTab('REQUEST')} className="px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700">✍️ 디자인 신규 요청</button>
+                <button onClick={handleEnterDesignerMode} className={`px-3 py-1.5 rounded-lg transition ${currentTab === 'DESIGNER' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600'}`}>🎨 디자이너 모드 🔒</button>
+              </div>
+            </div>
+          </header>
+
+          {/* 메인 뷰 */}
+          <main className="max-w-7xl mx-auto p-4 sm:p-6 flex-1 w-full">
+            {/* 1. 접수 목록 게시판 */}
+            {currentTab === 'BOARD' && (
+              <div className="space-y-4">
+                <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 border-b text-slate-500 font-bold">
+                      <tr>
+                        <th className="p-4">접수번호</th>
+                        <th className="p-4">품목</th>
+                        <th className="p-4">제작 사양 요약</th>
+                        <th className="p-4">신청자 (단체명)</th>
+                        <th className="p-4">납기 희망일</th>
+                        <th className="p-4">상태</th>
+                        <th className="p-4 text-center">시안 현황</th>
+                        <th className="p-4 text-right">의뢰 확인</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {orders.map((o) => {
+                        const latestDraft = o.drafts?.[o.drafts.length - 1];
+                        return (
+                          <tr key={o.id} className="hover:bg-slate-50 cursor-pointer" onClick={() => setPasswordModalOrder(o)}>
+                            <td className="p-4 font-bold text-slate-900">{o.orderNumber}</td>
+                            <td className="p-4"><span className="px-2 py-0.5 bg-blue-50 text-blue-700 rounded font-bold">{o.itemTypeName}</span></td>
+                            <td className="p-4 max-w-xs truncate">{o.summarySpecs || '🔒 비공개'}</td>
+                            <td className="p-4">{o.department || '비공개'}</td>
+                            <td className="p-4 font-bold text-rose-600">{o.dueDate}</td>
+                            <td className="p-4"><span className={`px-2 py-0.5 rounded-full font-bold text-[11px] border ${STATUS_MAP[o.status]?.badge}`}>{STATUS_MAP[o.status]?.label}</span></td>
+                            <td className="p-4 text-center">
+                              {latestDraft ? (
+                                <span className="px-2 py-0.5 bg-purple-50 text-purple-700 rounded font-bold border border-purple-200">🖼️ v{latestDraft.version} 🔒</span>
+                              ) : (
+                                <span className="text-slate-300">작업대기</span>
+                              )}
+                            </td>
+                            <td className="p-4 text-right">
+                              <button type="button" className="px-3 py-1 bg-slate-900 text-white rounded-lg font-bold">🔒 의뢰 보기</button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* 2. 새 의뢰 접수 화면 (1~10번 전체 항목) */}
+            {currentTab === 'REQUEST' && (
+              <NewRequestSubView
+                existingOrders={orders}
+                onCancel={() => setCurrentTab('BOARD')}
+                onSuccess={async newOrd => {
+                  try {
+                    const created=await api('/orders',{method:'POST',body:newOrd});
+                    await refreshOrders();setActiveOrderId(created.id);setCurrentTab('BOARD');
+                    triggerToast(`[${created.orderNumber}] 의뢰 접수 완료!`);
+                  } catch(err) {alert('의뢰 등록 실패: '+err.message);}
+                }}
+              />
+            )}
+
+            {/* 3. 디자이너 작업실 화면 */}
+            {currentTab === 'DESIGNER' && isDesignerAuthenticated && (
+              <DesignerWorkspaceSubView
+                orders={orders}
+                selectedOrder={selectedOrder}
+                onSelectOrderId={setActiveOrderId}
+                onDownloadSpec={downloadSpecFile}
+                onDownloadAllOrders={downloadAllOrdersCsv}
+                onDeleteOrder={(id, num) => setDeleteTargetOrder({ id, orderNumber: num })}
+                onOpenChangePwdModal={() => setShowChangePwdModal(true)}
+                onUpdateOrder={(updated) => {
+                  saveOrder(updated);
+                }}
+                triggerToast={triggerToast}
+              />
+            )}
+
+            {/* 4. 시안 검토 뷰어 & 핀포인트 메모 */}
+            {currentTab === 'REVIEW' && (authorizedReviewId === selectedOrder?.id || isDesignerAuthenticated) && (
+              <ClientReviewSubView
+                selectedOrder={selectedOrder}
+                onDeleteOrder={(id, num) => setDeleteTargetOrder({ id, orderNumber: num })}
+                onSwitchToDesigner={handleEnterDesignerMode}
+                onUpdateOrder={(updated) => {
+                  saveOrder(updated);
+                }}
+                triggerToast={triggerToast}
+              />
+            )}
+          </main>
+
+          {/* 하단 고정 액션바 */}
+          <div className="fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-xs border-t p-3">
+            <div className="max-w-md mx-auto flex gap-3">
+              <button onClick={() => setCurrentTab('REQUEST')} className="flex-1 py-3.5 bg-blue-600 hover:bg-blue-700 text-white font-black text-sm rounded-2xl shadow-lg shadow-blue-500/25 transition">✍️ 디자인 신규 요청</button>
+              <button onClick={handleEnterDesignerMode} className="py-3.5 px-5 bg-slate-900 hover:bg-black text-white font-bold text-xs rounded-2xl shadow-md transition">🎨 디자이너 모드 🔒</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // 6. [서브 컴포넌트] 신규 의뢰 접수
+    // ==========================================
+    function NewRequestSubView({ onCancel, onSuccess, existingOrders }) {
+      const [itemType, setItemType] = useState('BUSINESS_CARD');
+      const [requesterName, setRequesterName] = useState('');
+      const [department, setDepartment] = useState('');
+      const [contact, setContact] = useState('');
+      const [password, setPassword] = useState('');
+      const [dueDate, setDueDate] = useState(() => new Date().toLocaleDateString('sv-SE'));
+      const [requestNotes, setRequestNotes] = useState('');
+      const [contentNotes, setContentNotes] = useState('');
+      const [attachedFiles, setAttachedFiles] = useState([]);
+
+      // 세부 사양
+      const [cardQuantity, setCardQuantity] = useState(300);
+      const [leafletSize, setLeafletSize] = useState('A4');
+      const [leafletQuantity, setLeafletQuantity] = useState(1000);
+      const [leafletColor, setLeafletColor] = useState('흑백');
+      const [leafletSides, setLeafletSides] = useState('양면');
+      const [posterSize, setPosterSize] = useState('A2');
+      const [posterQuantity, setPosterQuantity] = useState(100);
+      const [posterColor, setPosterColor] = useState('칼라');
+      const [posterSides, setPosterSides] = useState('단면');
+      const [bannerWidth, setBannerWidth] = useState(300);
+      const [bannerHeight, setBannerHeight] = useState(90);
+      const [bannerQuantity, setBannerQuantity] = useState(1);
+      const [bannerFinish, setBannerFinish] = useState('각목');
+      const [webUsage, setWebUsage] = useState('SNS');
+      const [etcNotes, setEtcNotes] = useState('');
+       const [placardSize,setPlacardSize] = useState('2분할');
+       const [placardFinish,setPlacardFinish] = useState('없음');
+       const [placardQuantity,setPlacardQuantity] = useState(1);
+
+      // 배송
+      const [deliveryMethod, setDeliveryMethod] = useState('택배');
+      const [recipientName, setRecipientName] = useState('');
+      const [recipientPhone, setRecipientPhone] = useState('');
+      const [shippingAddress, setShippingAddress] = useState('서울 중구 퇴계로86가길 5 3층');
+
+      const [showReport, setShowReport] = useState(false);
+      const [reportData, setReportData] = useState(null);
+
+      const ITEM_NAMES = {
+        BUSINESS_CARD: '명함',
+        LEAFLET: '리플릿',
+        POSTER: '포스터',
+        BANNER: '현수막',
+        WEB_BANNER: '웹자보',
+        PLACARD: '팻말',
+        ETC: '기타'
+      };
+
+      const handleFormSubmit = (e) => {
+        e.preventDefault();
+        const now = new Date();
+        const yy = String(now.getFullYear()).slice(-2);
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const dd = String(now.getDate()).padStart(2, '0');
+        const safeDepartment = department.trim().replace(/[\\/:*?"<>|\r\n]/g, '-').replace(/\s+/g, ' ');
+        const baseOrderNumber = `${yy}${mm}${dd}-${safeDepartment}`;
+        const existingNumbers = new Set((existingOrders || []).map(o => o.orderNumber));
+        let ordNum = baseOrderNumber;
+        let sequence = 2;
+        while (existingNumbers.has(ordNum)) {
+          ordNum = `${baseOrderNumber}-${sequence++}`;
+        }
+        let summary = '';
+        let specsObj = {};
+
+        if (itemType === 'BUSINESS_CARD') {
+          summary = `표준 90×50mm / ${cardQuantity}매 / 기본지`;
+          specsObj = { 수량: `${cardQuantity}매` };
+        } else if (itemType === 'LEAFLET') {
+          summary = `크기 ${leafletSize} / 수량 ${leafletQuantity}부 / ${leafletColor} / ${leafletSides}`;
+          specsObj = { 크기: leafletSize, 수량: `${leafletQuantity}부`, 색상: leafletColor, 인쇄면: leafletSides };
+        } else if (itemType === 'POSTER') {
+          summary = `크기 ${posterSize} / 수량 ${posterQuantity}장 / ${posterColor} / ${posterSides}`;
+          specsObj = { 크기: posterSize, 수량: `${posterQuantity}장`, 색상: posterColor, 인쇄면: posterSides };
+        } else if (itemType === 'BANNER') {
+          summary = `가로 ${bannerWidth}cm × 세로 ${bannerHeight}cm / ${bannerQuantity}장 / 후가공: ${bannerFinish}`;
+          specsObj = { 규격: `${bannerWidth}×${bannerHeight}cm`, 수량: `${bannerQuantity}장`, 후가공: bannerFinish };
+        } else if (itemType === 'PLACARD') {
+           if (!Number.isInteger(placardQuantity) || placardQuantity < 1) { alert('팻말 수량은 1개 이상 입력해 주세요.'); return; }
+           summary = `크기 ${placardSize} / 수량 ${placardQuantity}개 / 후가공 ${placardFinish}`;
+           specsObj = { 크기: placardSize, 수량: `${placardQuantity}개`, 후가공: placardFinish };
+         } else if (itemType === 'WEB_BANNER') {
+          summary = `디지털 웹자보 / 용도: ${webUsage}`;
+          specsObj = { 용도: webUsage };
+        } else {
+          summary = `기타: ${etcNotes || '사양 메모 참조'}`;
+          specsObj = { 메모: etcNotes };
+        }
+
+        const rep = {
+          orderNumber: ordNum,
+          password,
+          requesterName,
+          department,
+          contact,
+          itemType,
+          itemTypeName: ITEM_NAMES[itemType],
+          summarySpecs: summary,
+          dueDate,
+          requestNotes,
+          contentNotes,
+          attachedFiles,
+          deliveryMethod,
+          recipientName: deliveryMethod === '사무실 출력' ? '' : recipientName,
+          recipientPhone: deliveryMethod === '사무실 출력' ? '' : recipientPhone,
+          shippingAddress: itemType === 'WEB_BANNER' ? '해당없음' : (deliveryMethod === '사무실 출력' ? '' : shippingAddress),
+          specsObj
+        };
+        setReportData(rep);
+        setShowReport(true);
+      };
+
+      const handleConfirmSend = () => {
+        const newOrd = {
+          id: `ord-${Date.now()}`,
+          orderNumber: reportData.orderNumber,
+          password: reportData.password,
+          requesterName: reportData.requesterName,
+          department: reportData.department,
+          contact: reportData.contact,
+          itemType: reportData.itemType,
+          itemTypeName: reportData.itemTypeName,
+          summarySpecs: reportData.summarySpecs,
+          dueDate: reportData.dueDate,
+          requestNotes: reportData.requestNotes,
+          contentNotes: reportData.contentNotes,
+          shippingAddress: reportData.shippingAddress,
+          deliveryMethod: reportData.deliveryMethod,
+          recipientName: reportData.recipientName,
+          recipientPhone: reportData.recipientPhone,
+          status: 'SUBMITTED',
+          specs: reportData.specsObj,
+          rawFiles: reportData.attachedFiles,
+          printHandoff: null,
+          drafts: [],
+          comments: []
+        };
+        setShowReport(false);
+        onSuccess(newOrd);
+      };
+
+      return (
+        <div className="max-w-2xl mx-auto bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-4 text-xs">
+          <div className="flex justify-between items-center border-b pb-3">
+            <h2 className="text-base font-black text-slate-900">디자인 신규 요청</h2>
+            <button onClick={onCancel} className="text-slate-400 font-bold hover:text-slate-600">✕ 취소</button>
+          </div>
+
+          <form onSubmit={handleFormSubmit} className="space-y-4">
+            <div>
+              <label className="block font-bold mb-1.5">1. 의뢰 품목 선택</label>
+              <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                {Object.entries(ITEM_NAMES).map(([k, v]) => (
+                  <button
+                    type="button"
+                    key={k}
+                    onClick={() => setItemType(k)}
+                    className={`py-2 rounded-xl font-bold border transition ${itemType === k ? 'bg-blue-600 text-white border-blue-600' : 'bg-slate-50 text-slate-700'}`}
+                  >
+                    {v}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="bg-slate-50 p-4 rounded-xl border space-y-3">
+              <span className="font-bold block">신청자 정보 & 열람 암호</span>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <div><label className="block font-medium mb-1">신청자</label><input required value={requesterName} onChange={(e) => setRequesterName(e.target.value)} className="w-full border p-2 rounded-lg bg-white" /></div>
+                <div><label className="block font-medium mb-1">단체명</label><input required value={department} onChange={(e) => setDepartment(e.target.value)} className="w-full border p-2 rounded-lg bg-white" /></div>
+                <div><label className="block font-medium mb-1">연락처</label><input required value={contact} onChange={(e) => setContact(e.target.value)} className="w-full border p-2 rounded-lg bg-white" /></div>
+                <div><label className="block font-bold text-purple-700 mb-1">🔒 암호</label><input type="password" minLength="4" required value={password} onChange={(e) => setPassword(e.target.value)} className="w-full border-2 border-purple-300 p-2 rounded-lg font-bold text-center bg-white" /></div>
+              </div>
+            </div>
+
+            {/* 품목별 옵션 */}
+            <div className="bg-blue-50/40 p-4 rounded-xl border border-blue-200 space-y-3">
+              <span className="font-bold text-blue-900 block">{ITEM_NAMES[itemType]} 세부 사양</span>
+              {itemType === 'BUSINESS_CARD' && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div><label className="block mb-1">수량 (기본 300)</label><input type="number" step="100" value={cardQuantity} onChange={(e) => setCardQuantity(Number(e.target.value))} className="w-full border p-2 rounded-lg bg-white font-bold" /></div>
+                  <div><label className="block mb-1">납기 희망일</label><input type="date" required value={dueDate} onChange={(e) => setDueDate(e.target.value)} className="w-full border p-2 rounded-lg bg-white font-bold text-rose-600" /></div>
+                </div>
+              )}
+              {itemType === 'LEAFLET' && (
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  <div><label className="block mb-1">크기</label><select value={leafletSize} onChange={(e) => setLeafletSize(e.target.value)} className="w-full border p-2 rounded-lg bg-white"><option>A5</option><option>A4</option><option>A3</option><option>B5</option><option>B4</option></select></div>
+                  <div><label className="block mb-1">수량</label><input type="number" value={leafletQuantity} onChange={(e) => setLeafletQuantity(Number(e.target.value))} className="w-full border p-2 rounded-lg bg-white font-bold" /></div>
+                  <div><label className="block mb-1">색상</label><select value={leafletColor} onChange={(e) => setLeafletColor(e.target.value)} className="w-full border p-2 rounded-lg bg-white"><option>칼라</option><option>흑백</option></select></div>
+                  <div><label className="block mb-1">면</label><select value={leafletSides} onChange={(e) => setLeafletSides(e.target.value)} className="w-full border p-2 rounded-lg bg-white"><option>양면</option><option>단면</option></select></div>
+                  <div><label className="block mb-1">납기일</label><input type="date" required value={dueDate} onChange={(e) => setDueDate(e.target.value)} className="w-full border p-2 rounded-lg bg-white font-bold text-rose-600" /></div>
+                </div>
+              )}
+              {itemType === 'POSTER' && (
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  <div><label className="block mb-1">크기</label><select value={posterSize} onChange={(e) => setPosterSize(e.target.value)} className="w-full border p-2 rounded-lg bg-white"><option>A3</option><option>A2</option><option>A1</option><option>B4</option><option>B3</option><option>B2</option></select></div>
+                  <div><label className="block mb-1">수량</label><input type="number" value={posterQuantity} onChange={(e) => setPosterQuantity(Number(e.target.value))} className="w-full border p-2 rounded-lg bg-white font-bold" /></div>
+                  <div><label className="block mb-1">색상</label><select value={posterColor} onChange={(e) => setPosterColor(e.target.value)} className="w-full border p-2 rounded-lg bg-white"><option>칼라</option><option>흑백</option></select></div>
+                  <div><label className="block mb-1">면</label><select value={posterSides} onChange={(e) => setPosterSides(e.target.value)} className="w-full border p-2 rounded-lg bg-white"><option>단면</option><option>양면</option></select></div>
+                  <div><label className="block mb-1">납기일</label><input type="date" required value={dueDate} onChange={(e) => setDueDate(e.target.value)} className="w-full border p-2 rounded-lg bg-white font-bold text-rose-600" /></div>
+                </div>
+              )}
+              {itemType === 'BANNER' && (
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  <div><label className="block mb-1">가로(cm)</label><input type="number" value={bannerWidth} onChange={(e) => setBannerWidth(Number(e.target.value))} className="w-full border p-2 rounded-lg bg-white font-bold" /></div>
+                  <div><label className="block mb-1">세로(cm)</label><input type="number" value={bannerHeight} onChange={(e) => setBannerHeight(Number(e.target.value))} className="w-full border p-2 rounded-lg bg-white font-bold" /></div>
+                  <div><label className="block mb-1">수량</label><input type="number" value={bannerQuantity} onChange={(e) => setBannerQuantity(Number(e.target.value))} className="w-full border p-2 rounded-lg bg-white font-bold" /></div>
+                  <div><label className="block mb-1">후가공</label><select value={bannerFinish} onChange={(e) => setBannerFinish(e.target.value)} className="w-full border p-2 rounded-lg bg-white"><option>없음</option><option>각목</option><option>각목재봉만</option><option>행진용배너재봉</option><option>타공</option></select></div>
+                  <div><label className="block mb-1">납기일</label><input type="date" required value={dueDate} onChange={(e) => setDueDate(e.target.value)} className="w-full border p-2 rounded-lg bg-white font-bold text-rose-600" /></div>
+                </div>
+              )}
+              {itemType === 'PLACARD' && (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <div>
+                    <label className="block mb-1">팻말 크기</label>
+                    <select value={placardSize} onChange={(e) => setPlacardSize(e.target.value)} className="w-full border p-2 rounded-lg bg-white">
+                      <option value="2분할">2분할</option>
+                      <option value="4분할">4분할</option>
+                      <option value="손팻말">손팻말</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block mb-1">후가공</label>
+                    <select value={placardFinish} onChange={(e) => setPlacardFinish(e.target.value)} className="w-full border p-2 rounded-lg bg-white">
+                      <option value="없음">없음</option>
+                      <option value="무광코팅">무광코팅</option>
+                      <option value="유광코팅">유광코팅</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block mb-1">수량 (개)</label>
+                    <input type="number" min="1" step="1" required value={placardQuantity} onChange={(e) => setPlacardQuantity(Number(e.target.value))} className="w-full border p-2 rounded-lg bg-white font-bold" />
+                  </div>
+                  <div>
+                    <label className="block mb-1">납기 희망일</label>
+                    <input type="date" required value={dueDate} onChange={(e) => setDueDate(e.target.value)} className="w-full border p-2 rounded-lg bg-white font-bold text-rose-600" />
+                  </div>
+                </div>
+              )}
+              {itemType === 'WEB_BANNER' && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div><label className="block mb-1">용도</label><select value={webUsage} onChange={(e) => setWebUsage(e.target.value)} className="w-full border p-2 rounded-lg bg-white"><option>SNS</option><option>메일</option><option>카드뉴스</option></select></div>
+                  <div><label className="block mb-1">납기 희망일</label><input type="date" required value={dueDate} onChange={(e) => setDueDate(e.target.value)} className="w-full border p-2 rounded-lg bg-white font-bold text-rose-600" /></div>
+                </div>
+              )}
+              {itemType === 'ETC' && (
+                <div className="space-y-2">
+                  <input placeholder="제작 메모 (예: 현판, 봉투 사양)" value={etcNotes} onChange={(e) => setEtcNotes(e.target.value)} className="w-full border p-2 rounded-lg bg-white" />
+                  <input type="date" required value={dueDate} onChange={(e) => setDueDate(e.target.value)} className="w-full border p-2 rounded-lg bg-white font-bold text-rose-600" />
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label className="block font-bold mb-1">디자인 요청사항</label>
+              <textarea rows="2" value={requestNotes} onChange={(e) => setRequestNotes(e.target.value)} placeholder="요청사항 입력" className="w-full border p-2.5 rounded-xl bg-slate-50 resize-none" />
+            </div>
+
+            <div>
+              <label className="block font-bold mb-1">인쇄/제작 내용 (원고 텍스트)</label>
+              <textarea rows="3" value={contentNotes} onChange={(e) => setContentNotes(e.target.value)} placeholder="원고 본문 직접 입력" className="w-full border p-2.5 rounded-xl bg-slate-50 resize-none" />
+            </div>
+
+            {/* 파일 첨부 */}
+            <div className="border border-dashed p-3 rounded-xl bg-slate-50 text-center">
+              <input
+                type="file"
+                multiple
+                id="fileUpload"
+                className="hidden"
+                onChange={async (e) => {
+                  try { const files=await Promise.all(Array.from(e.target.files||[]).map(storeLocalFile)); setAttachedFiles(prev=>[...prev,...files]); } catch(err) { alert('파일 저장 실패: '+err.message); }
+                }}
+              />
+              <label htmlFor="fileUpload" className="cursor-pointer text-blue-600 font-bold block">📎 원고 파일 첨부하기 (클릭)</label>
+              {attachedFiles.length > 0 && (
+                <div className="mt-2 text-left space-y-1">
+                  <FileLinks files={attachedFiles} />
+                </div>
+              )}
+            </div>
+
+            {/* 배송 (웹자보 제외) */}
+            {itemType !== 'WEB_BANNER' && (
+              <div className="bg-slate-50 p-4 rounded-xl border space-y-3">
+                <span className="font-bold block">배송 및 수령 정보</span>
+                <div className="flex gap-2">
+                  {['택배', '퀵', '방문', '사무실 출력'].map((m) => (
+                    <button key={m} type="button" onClick={() => setDeliveryMethod(m)} className={`px-3 py-1.5 rounded-lg border font-bold ${deliveryMethod === m ? 'bg-slate-900 text-white' : 'bg-white'}`}>{m}</button>
+                  ))}
+                </div>
+                {deliveryMethod !== '사무실 출력' && (
+                  <>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input placeholder="받는 사람" required value={recipientName} onChange={(e) => setRecipientName(e.target.value)} className="border p-2 rounded-lg bg-white" />
+                      <input placeholder="전화번호" required value={recipientPhone} onChange={(e) => setRecipientPhone(e.target.value)} className="border p-2 rounded-lg bg-white" />
+                    </div>
+                    {deliveryMethod !== '방문' && (
+                      <input placeholder="배송지 주소" value={shippingAddress} onChange={(e) => setShippingAddress(e.target.value)} className="w-full border p-2 rounded-lg bg-white" />
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            <button type="submit" className="w-full py-3.5 bg-blue-600 hover:bg-blue-700 text-white font-black text-sm rounded-xl shadow-md">디자인 요청 (보고서 확인) →</button>
+          </form>
+
+          {/* 보고서 확인 모달 */}
+          {showReport && reportData && (
+            <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-2xl border">
+                <h3 className="font-black text-base border-b pb-2">📄 디자인 의뢰 명세 보고서 [{reportData.orderNumber}]</h3>
+                <div className="bg-slate-50 p-4 rounded-xl space-y-2 text-slate-700">
+                  <div><strong>품목:</strong> {reportData.itemTypeName} ({reportData.summarySpecs})</div>
+                  <div><strong>신청자:</strong> {reportData.requesterName} ({reportData.department}) | <strong>납기:</strong> {reportData.dueDate}</div>
+                  <div><strong>암호:</strong> 설정됨 (분실하지 마세요)</div>
+                  <div><strong>요청사항:</strong> {reportData.requestNotes || '없음'}</div>
+                   <div><strong>원고 파일:</strong> {reportData.attachedFiles.map(f=>f.name).join(', ')||'없음'}</div>
+                  <div><strong>배송:</strong> {reportData.deliveryMethod} - {reportData.recipientName} ({reportData.recipientPhone})</div>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => setShowReport(false)} className="flex-1 py-2.5 bg-slate-100 rounded-xl font-bold">수정하기</button>
+                  <button onClick={handleConfirmSend} className="flex-1 py-2.5 bg-blue-600 text-white rounded-xl font-bold">저장</button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ==========================================
+    // 7. [서브 컴포넌트] 디자이너 작업실
+    // ==========================================
+    function DesignerWorkspaceSubView({
+      orders,
+      selectedOrder,
+      onSelectOrderId,
+      onDownloadSpec,
+      onDownloadAllOrders,
+      onDeleteOrder,
+      onOpenChangePwdModal,
+      onUpdateOrder,
+      triggerToast
+    }) {
+      const [customFile, setCustomFile] = useState(null);
+       const [printFile,setPrintFile]=useState(null);
+      const [customPreview, setCustomPreview] = useState('');
+      const [designerNote, setDesignerNote] = useState('');
+
+      // 인쇄소 발주 기록 (초기값 비어있음)
+      const [handoffDesigner, setHandoffDesigner] = useState('');
+      const [handoffShop, setHandoffShop] = useState('');
+      const [handoffMethod, setHandoffMethod] = useState('');
+      const [handoffDate, setHandoffDate] = useState('');
+      const [handoffFileName, setHandoffFileName] = useState('');
+      const [handoffMemo, setHandoffMemo] = useState('');
+
+      // 디자이너는 의뢰 전체를 수정할 수 있다. 변경 사항은 저장 버튼을 누르기 전까지 반영되지 않는다.
+      const [editOpen, setEditOpen] = useState(false);
+      const [editData, setEditData] = useState(null);
+      const [extraRequestFiles, setExtraRequestFiles] = useState([]);
+      const editOrderField = (key, value) => setEditData(prev => ({...prev, [key]: value}));
+      const editSpecField = (key, value) => setEditData(prev => ({...prev, specs: {...(prev.specs||{}), [key]: value}}));
+      const makeEditableCopy = (o) => ({...o, specs: {...(o.specs||{})}, rawFiles: [...(o.rawFiles||[])]});
+      const ITEM_LABELS = { BUSINESS_CARD:'명함', LEAFLET:'리플릿', POSTER:'포스터', BANNER:'현수막', WEB_BANNER:'웹자보', PLACARD:'팻말', ETC:'기타' };
+      const handleSaveOrderEdits = async (e) => {
+        e.preventDefault();
+        if (!editData) return;
+        if (!editData.requesterName.trim() || !editData.contact.trim() || !editData.department.trim() || !editData.dueDate) {
+          alert('신청자, 소속, 연락처, 납기일은 반드시 입력해야 합니다.'); return;
+        }
+        if (editData.deliveryMethod !== '사무실 출력' && editData.itemType !== 'WEB_BANNER' &&
+            (!editData.recipientName?.trim() || !editData.recipientPhone?.trim())) {
+          alert('수령자 이름과 연락처를 입력해 주세요.'); return;
+        }
+        let newFiles=[];
+        try { newFiles=await Promise.all(extraRequestFiles.map(f=>storeLocalFile(f))); }
+        catch(err){ alert('원고 파일 저장 실패: '+err.message); return; }
+        const updated={
+          ...editData,
+          itemTypeName:ITEM_LABELS[editData.itemType]||editData.itemTypeName,
+          rawFiles:[...(editData.rawFiles||[]),...newFiles],
+          summarySpecs:Object.entries(editData.specs||{}).filter(([k,v])=>String(v).trim()).map(([k,v])=>`${k}: ${v}`).join(' / '),
+          adminEditHistory:[...(selectedOrder.adminEditHistory||[]),{at:new Date().toISOString(),message:'디자이너가 발주 및 배송 정보를 수정'}]
+        };
+        onUpdateOrder(updated);
+        setExtraRequestFiles([]);
+        setEditOpen(false);
+        triggerToast('발주 내용 및 배송·수령 정보를 저장했습니다.');
+      };
+
+
+      useEffect(() => {
+        if (selectedOrder?.printHandoff) {
+          setHandoffDesigner(selectedOrder.printHandoff.designerName || '');
+          setHandoffShop(selectedOrder.printHandoff.printShop || '');
+          setHandoffMethod(selectedOrder.printHandoff.method || '');
+          setHandoffDate(selectedOrder.printHandoff.expectedDate || '');
+          setHandoffFileName(selectedOrder.printHandoff.fileName || '');
+          setHandoffMemo(selectedOrder.printHandoff.memo || '');
+        } else {
+          setHandoffDesigner('');
+          setHandoffShop('');
+          setHandoffMethod('');
+          setHandoffDate('');
+          setHandoffFileName('');
+          setHandoffMemo('');
+        }
+      }, [selectedOrder?.id]);
+      useEffect(() => {
+        if (selectedOrder) setEditData(makeEditableCopy(selectedOrder));
+        setEditOpen(false);
+        setExtraRequestFiles([]);
+      }, [selectedOrder?.id]);
+
+      if (!selectedOrder) return <div className="p-8 text-center bg-white rounded-xl">선택된 의뢰가 없습니다.</div>;
+
+      const nextVer = (selectedOrder.drafts?.length || 0) + 1;
+
+      const handleUpload = async (e) => {
+        e.preventDefault();
+        if (!customFile) {alert('시안 파일을 먼저 선택해 주세요.');return;}
+        let savedFile; try {savedFile=await storeLocalFile(customFile);} catch(err) {alert('시안 저장 실패: '+err.message);return;}
+        const newDraft = {
+          version: nextVer,
+          fileName: savedFile.name,
+           storedFile: savedFile,
+          imageUrl: '',
+          designerNote: designerNote.trim() || `${nextVer}차 시안 작업 완료`,
+          uploadedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          uploadedBy: handoffDesigner || '담당 디자이너',
+          pins: []
+        };
+        const updated = {
+          ...selectedOrder,
+          status: 'REVIEW_REQUESTED',
+          drafts: [...(selectedOrder.drafts || []), newDraft]
+        };
+        onUpdateOrder(updated);
+        setCustomFile(null);
+        setCustomPreview('');
+        setDesignerNote('');
+        triggerToast(`시안 v${nextVer} 등록 완료!`);
+      };
+
+      const handleSaveHandoff = async (e) => {
+        e.preventDefault();
+        let storedPrintFile=selectedOrder.printHandoff?.storedPrintFile||null;
+        if(printFile) { try {storedPrintFile=await storeLocalFile(printFile);} catch(err){alert('인쇄 파일 저장 실패: '+err.message);return;} }
+        const updated = {
+          ...selectedOrder,
+          status: selectedOrder.status === 'APPROVED' ? 'READY_TO_PRINT' : selectedOrder.status,
+          printHandoff: {
+            designerName: handoffDesigner,
+            printShop: handoffShop,
+            method: handoffMethod,
+            expectedDate: handoffDate,
+            fileName: storedPrintFile?.name || handoffFileName,
+            storedPrintFile,
+            memo: handoffMemo
+          }
+        };
+        onUpdateOrder(updated);
+        triggerToast('인쇄소 발주 기록 저장 완료');
+      };
+
+      return (
+        <div className="space-y-6 text-xs">
+          {/* 상단 툴바 */}
+          <div className="bg-slate-900 text-white p-4 rounded-2xl flex justify-between items-center">
+            <div>
+              <h2 className="font-extrabold text-base">🎨 디자이너 전용 작업실</h2>
+              <span className="text-slate-400">의뢰 확인 및 시안 첨부, 인쇄소 발주 기록</span>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={onDownloadAllOrders} className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg font-bold">📊 전체 접수 내역 다운로드 (엑셀)</button>
+              <button onClick={onOpenChangePwdModal} className="px-3 py-1.5 bg-slate-800 rounded-lg font-bold border border-slate-700">⚙️ 암호 변경</button>
+              <button onClick={() => onDownloadSpec(selectedOrder)} className="px-3 py-1.5 bg-emerald-600 rounded-lg font-bold">📄 사양서 다운</button>
+            </div>
+          </div>
+
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {orders.map((o) => (
+              <button
+                key={o.id}
+                onClick={() => onSelectOrderId(o.id)}
+                className={`px-3 py-1.5 rounded-xl font-bold shrink-0 ${selectedOrder.id === o.id ? 'bg-slate-900 text-white' : 'bg-white border text-slate-700'}`}
+              >
+                [{o.orderNumber}] {o.itemTypeName}
+              </button>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            {/* 좌측: 접수 내용 확인 */}
+            <div className="lg:col-span-5 bg-white p-5 rounded-2xl border space-y-4">
+              <div className="flex justify-between items-center border-b pb-2">
+                <h3 className="font-bold text-sm text-slate-900">1. 접수 내용 확인</h3>
+                <button onClick={() => onDeleteOrder(selectedOrder.id, selectedOrder.orderNumber)} className="text-rose-600 font-bold px-2 py-1 bg-rose-50 rounded-lg">🗑️ 의뢰 삭제</button>
+              </div>
+              <div className="space-y-2 text-slate-700">
+                <div><strong>주문번호:</strong> {selectedOrder.orderNumber}</div>
+                <div><strong>신청자:</strong> {selectedOrder.requesterName} ({selectedOrder.department}) | {selectedOrder.contact}</div>
+                <div><strong>납기일:</strong> <span className="text-rose-600 font-bold">{selectedOrder.dueDate}</span></div>
+                <div><strong>사양:</strong> {selectedOrder.summarySpecs}</div>
+                <div className="p-2.5 bg-slate-50 rounded-lg border"><strong>💡 요청사항:</strong> {selectedOrder.requestNotes || '없음'}</div>
+                <div className="p-2.5 bg-slate-50 rounded-lg border"><strong>📝 본문 원고:</strong> <pre className="font-sans whitespace-pre-wrap">{selectedOrder.contentNotes || '없음'}</pre></div>
+                <div className="p-2.5 bg-slate-50 rounded-lg border"><strong>📎 원고 파일:</strong><FileLinks files={selectedOrder.rawFiles||[]} /></div>
+                <div className="p-2.5 bg-slate-50 rounded-lg border space-y-1">
+                  <div className="font-bold">🚚 배송 및 수령 정보</div>
+                  <div>수령 방법: {selectedOrder.deliveryMethod || '미지정'}</div>
+                  <div>수령자: {selectedOrder.recipientName || '미입력'}</div>
+                  <div>전화번호: {selectedOrder.recipientPhone || '미입력'}</div>
+                  <div>주소: {selectedOrder.shippingAddress || '미입력'}</div>
+                </div>
+                <div className="p-3 rounded-xl border border-amber-200 bg-amber-50 space-y-2">
+                  <h4 className="font-bold text-amber-950">💬 의뢰자 수정 요청 및 시안 피드백</h4>
+                  {(selectedOrder.comments || []).length === 0 && !(selectedOrder.drafts || []).some(d => (d.pins || []).length) && (
+                    <p className="text-slate-500">등록된 피드백이 없습니다.</p>
+                  )}
+                  {(selectedOrder.comments || []).map((c, i) => (
+                    <div key={c.id || i} className="bg-white border rounded-lg p-2 whitespace-pre-wrap">
+                      <span className="font-bold">{c.author || '의뢰자'} · {c.time || ''}</span>
+                      <p className="mt-1">{c.content || ''}</p>
+                    </div>
+                  ))}
+                  {(selectedOrder.drafts || []).flatMap(d => (d.pins || []).map((pin, i) => ({pin, version:d.version, i}))).map(({pin, version, i}) => (
+                    <div key={`pin-${version}-${pin.id || i}`} className="bg-white border rounded-lg p-2 whitespace-pre-wrap">
+                      <span className="font-bold">📍 시안 v{version} · {pin.author || '의뢰자'}</span>
+                      <p className="mt-1">{pin.comment || ''}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex justify-end">
+                  <button type="button" onClick={() => {setEditData(makeEditableCopy(selectedOrder));setExtraRequestFiles([]);setEditOpen(v=>!v);}} className="px-4 py-2 rounded-lg bg-blue-600 text-white font-bold">✏️ 전체 발주 내용 및 배송 수정 {editOpen?'닫기':'열기'}</button>
+                </div>
+                {editOpen && editData && (
+                  <form onSubmit={handleSaveOrderEdits} className="rounded-xl border-2 border-blue-200 bg-blue-50/40 p-4 space-y-3">
+                    <div className="font-bold text-blue-900">관리자 수정 · 기존 의뢰 직접 교정</div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {[
+                        ['requesterName','신청자 이름'], ['department','단체명'],
+                        ['contact','담당자 연락처'], ['dueDate','완료 희망일']
+                      ].map(([key,label]) => <label key={key} className="block space-y-1">
+                        <span className="font-medium">{label}</span>
+                        <input required type={key==='dueDate'?'date':'text'} value={editData[key]||''} onChange={e=>editOrderField(key,e.target.value)} className="w-full border p-2 rounded-lg bg-white" />
+                      </label>)}
+                    </div>
+                    <label className="block space-y-1"><span className="font-medium">품목</span>
+                      <select value={editData.itemType} onChange={e=>editOrderField('itemType',e.target.value)} className="w-full border p-2 rounded-lg bg-white">
+                        {Object.entries(ITEM_LABELS).map(([key,val])=><option key={key} value={key}>{val}</option>)}
+                      </select>
+                    </label>
+                    <div className="space-y-2 rounded-lg bg-white border p-3">
+                      <div className="font-bold">인쇄 의뢰 세부 사양 (항목별 수정)</div>
+                      {Object.entries(editData.specs||{}).map(([key,value])=><label key={key} className="flex gap-2 items-center">
+                        <span className="w-24 shrink-0">{key}</span>
+                        <input value={String(value??'')} onChange={e=>editSpecField(key,e.target.value)} className="min-w-0 flex-1 border p-2 rounded-lg" />
+                        <button type="button" onClick={()=>setEditData(prev=>{const n={...prev.specs};delete n[key];return {...prev,specs:n};})} className="text-rose-600">삭제</button>
+                      </label>)}
+                      <div className="flex gap-2">
+                        <input id="new-spec-name" placeholder="새 사양명" className="w-1/2 border p-2 rounded-lg" />
+                        <input id="new-spec-value" placeholder="내용" className="w-1/2 border p-2 rounded-lg" />
+                        <button type="button" onClick={()=>{const k=document.getElementById('new-spec-name').value.trim();const v=document.getElementById('new-spec-value').value;if(!k)return alert('사양명을 입력하세요.');editSpecField(k,v);document.getElementById('new-spec-name').value='';document.getElementById('new-spec-value').value='';}} className="shrink-0 bg-slate-800 text-white px-2 rounded-lg">추가</button>
+                      </div>
+                    </div>
+                    <label className="block space-y-1"><span className="font-medium">디자인 요청사항</span>
+                      <textarea rows="2" value={editData.requestNotes||''} onChange={e=>editOrderField('requestNotes',e.target.value)} className="w-full border p-2 rounded-lg bg-white" />
+                    </label>
+                    <label className="block space-y-1"><span className="font-medium">원고 내용</span>
+                      <textarea rows="3" value={editData.contentNotes||''} onChange={e=>editOrderField('contentNotes',e.target.value)} className="w-full border p-2 rounded-lg bg-white" />
+                    </label>
+                    <div className="bg-white rounded-lg border p-3 space-y-2">
+                      <div className="font-bold">원고 첨부파일 관리</div>
+                      {(editData.rawFiles||[]).map((f,i)=><div key={f.id||i} className="flex justify-between gap-2 items-center"><span className="truncate">{f.name}</span><button type="button" onClick={()=>editOrderField('rawFiles',editData.rawFiles.filter((_,j)=>i!==j))} className="text-rose-600">목록에서 제거</button></div>)}
+                      <input type="file" multiple onChange={e=>setExtraRequestFiles(Array.from(e.target.files||[]))} className="w-full border p-2 rounded-lg" />
+                    </div>
+                    <div className="rounded-lg border bg-white p-3 space-y-2">
+                      <div className="font-bold">배송 및 수령 정보 수정</div>
+                      <label className="block space-y-1"><span>수령 방법</span>
+                        <select value={editData.deliveryMethod||'택배'} onChange={e=>editOrderField('deliveryMethod',e.target.value)} className="w-full border p-2 rounded-lg">
+                          {['택배','퀵','방문','사무실 출력'].map(v=><option key={v}>{v}</option>)}
+                        </select>
+                      </label>
+                      {editData.deliveryMethod !== '사무실 출력' && <><div className="grid grid-cols-2 gap-2">
+                        <label className="space-y-1"><span>수령자 이름</span><input value={editData.recipientName||''} onChange={e=>editOrderField('recipientName',e.target.value)} className="w-full border p-2 rounded-lg" /></label>
+                        <label className="space-y-1"><span>수령자 연락처</span><input value={editData.recipientPhone||''} onChange={e=>editOrderField('recipientPhone',e.target.value)} className="w-full border p-2 rounded-lg" /></label>
+                      </div>
+                      <label className="block space-y-1"><span>배송지 주소 / 수령 장소</span><textarea rows="2" value={editData.shippingAddress||''} onChange={e=>editOrderField('shippingAddress',e.target.value)} className="w-full border p-2 rounded-lg" /></label></>}
+                    </div>
+                    <label className="block space-y-1"><span>진행 상태 (관리자 교정)</span><select value={editData.status} onChange={e=>editOrderField('status',e.target.value)} className="w-full border p-2 rounded-lg bg-white">{Object.entries(STATUS_MAP).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}</select></label>
+                    <div className="flex gap-2">
+                      <button type="button" onClick={()=>{setEditOpen(false);setEditData(makeEditableCopy(selectedOrder));}} className="flex-1 p-2 rounded-lg bg-slate-200">취소</button>
+                      <button type="submit" className="flex-1 p-2 rounded-lg bg-blue-600 text-white font-bold">변경사항 저장</button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            </div>
+
+            {/* 우측: 시안 등록 & 인쇄소 발주 */}
+            <div className="lg:col-span-7 space-y-4">
+              {/* 시안 등록 */}
+              <form onSubmit={handleUpload} className="bg-white p-5 rounded-2xl border space-y-3">
+                <h3 className="font-bold text-sm text-purple-900 border-b pb-2">2. 새 시안(그림) 첨부해서 올리기 (v{nextVer})</h3>
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) {
+                      setCustomFile(f);
+                      setCustomPreview(f.name);
+                    }
+                  }}
+                  className="w-full border p-2 rounded-xl bg-slate-50"
+                />
+                <input placeholder="작업 내용 메모 (예: 2차 수정 반영)" value={designerNote} onChange={(e) => setDesignerNote(e.target.value)} className="w-full border p-2.5 rounded-xl bg-slate-50" />
+                <button type="submit" className="w-full py-2.5 bg-purple-600 text-white font-bold rounded-xl shadow-xs">v{nextVer} 시안 등록 (이 브라우저에 저장)</button>
+              </form>
+
+              {/* 인쇄소 발주 기록 */}
+              <form onSubmit={handleSaveHandoff} className="bg-white p-5 rounded-2xl border space-y-3">
+                <div className="flex justify-between items-center border-b pb-2">
+                  <h3 className="font-bold text-sm text-slate-900">3. 인쇄소 전달 및 발주 기록</h3>
+                  <button type="button" onClick={() => { setHandoffDesigner(''); setHandoffShop(''); setHandoffMethod(''); setHandoffDate(''); setHandoffFileName(''); setHandoffMemo(''); }} className="text-slate-400 font-bold underline">초기화</button>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <input required placeholder="디자이너 이름" value={handoffDesigner} onChange={(e) => setHandoffDesigner(e.target.value)} className="border p-2 rounded-lg bg-slate-50 font-bold" />
+                  <input required placeholder="인쇄소 이름 (성진애드컴 등)" value={handoffShop} onChange={(e) => setHandoffShop(e.target.value)} className="border p-2 rounded-lg bg-slate-50 font-bold" />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <select required value={handoffMethod} onChange={(e) => setHandoffMethod(e.target.value)} className="border p-2 rounded-lg bg-slate-50 font-bold">
+                    <option value="">-- 인쇄 방법 선택 --</option>
+                    <option>합판옵셋</option>
+                    <option>독판옵셋</option>
+                    <option>디지털인쇄</option>
+                    <option>실사출력</option>
+                  </select>
+                  <input type="date" required value={handoffDate} onChange={(e) => setHandoffDate(e.target.value)} className="border p-2 rounded-lg bg-slate-50 font-bold text-blue-700" />
+                </div>
+                <input type="file" onChange={e=>setPrintFile(e.target.files?.[0]||null)} className="w-full border p-2 rounded-lg bg-slate-50" />
+                {selectedOrder.printHandoff?.storedPrintFile && <FileLinks files={[selectedOrder.printHandoff.storedPrintFile]} />}
+                <input placeholder="인쇄 파일명 (PDF, AI 등)" value={handoffFileName} onChange={(e) => setHandoffFileName(e.target.value)} className="w-full border p-2 rounded-lg bg-slate-50" />
+                <textarea rows="2" placeholder="발주 메모" value={handoffMemo} onChange={(e) => setHandoffMemo(e.target.value)} className="w-full border p-2 rounded-lg bg-slate-50 resize-none" />
+                <button type="submit" className="w-full py-2.5 bg-slate-900 text-white font-bold rounded-xl">인쇄소 발주 기록 저장</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // 8. [서브 컴포넌트] 시안 검토 & 핀포인트 뷰어
+    // ==========================================
+    function ClientReviewSubView({ selectedOrder, onDeleteOrder, onSwitchToDesigner, onUpdateOrder, triggerToast }) {
+      if (!selectedOrder) return null;
+      const drafts = selectedOrder.drafts || [];
+      const [selectedVer, setSelectedVer] = useState(drafts.length > 0 ? drafts[drafts.length - 1].version : 1);
+      const [isPinMode, setIsPinMode] = useState(false);
+      const [feedbackText, setFeedbackText] = useState('');
+
+      useEffect(()=>{setSelectedVer(drafts.length ? drafts[drafts.length-1].version : 1);setIsPinMode(false);},[selectedOrder.id]);
+      const curDraft = drafts.find((d) => d.version === selectedVer) || drafts[drafts.length - 1];
+
+      const handleApprove = () => {
+        if(!curDraft || curDraft.version !== drafts[drafts.length-1]?.version || !['REVIEW_REQUESTED','REVISION_NEEDED'].includes(selectedOrder.status)){alert('검토할 시안이 없거나 승인 가능한 상태가 아닙니다.');return;}
+        if(!window.confirm(`v${curDraft.version} 시안을 최종 승인하시겠습니까?`))return;
+        const updated = {
+          ...selectedOrder,
+          status: 'APPROVED',
+          approvedDraftVersion: curDraft.version,
+          comments: [...(selectedOrder.comments || []), { id: `c-${Date.now()}`, author: selectedOrder.requesterName, role: 'REQUESTER', content: `[최종 승인] v${curDraft?.version} 시안 확정`, time: '방금 전' }]
+        };
+        onUpdateOrder(updated);
+        triggerToast('최종 시안 승인 완료!');
+      };
+
+      const handleRequestRevision = () => {
+        if(!curDraft) {alert('수정 요청할 시안이 없습니다.');return;}
+        if (!feedbackText.trim()) return;
+        const updated = {
+          ...selectedOrder,
+          status: 'REVISION_NEEDED',
+          comments: [...(selectedOrder.comments || []), { id: `c-${Date.now()}`, author: selectedOrder.requesterName, role: 'REQUESTER', content: `[수정 요청] ${feedbackText}`, time: '방금 전' }]
+        };
+        onUpdateOrder(updated);
+        setFeedbackText('');
+        triggerToast('수정 요청 전달 완료');
+      };
+
+      return (
+        <div className="space-y-4 text-xs">
+          <div className="bg-white p-5 rounded-2xl border flex justify-between items-center">
+            <div>
+              <h2 className="text-base font-black text-slate-900">[{selectedOrder.orderNumber}] 의뢰 내역 및 시안 확인</h2>
+              <span className="text-slate-400">신청자: {selectedOrder.requesterName} | 상태: {STATUS_MAP[selectedOrder.status]?.label}</span>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={() => onDeleteOrder(selectedOrder.id, selectedOrder.orderNumber)} className="px-3 py-1.5 bg-rose-50 text-rose-600 font-bold rounded-lg">🗑️ 의뢰 삭제</button>
+              <button onClick={handleApprove} disabled={!curDraft || curDraft.version !== drafts[drafts.length-1]?.version || !['REVIEW_REQUESTED','REVISION_NEEDED'].includes(selectedOrder.status)} className="px-3 py-1.5 bg-emerald-600 text-white font-bold rounded-lg">✓ 최종 시안 승인</button>
+              <button onClick={onSwitchToDesigner} className="px-3 py-1.5 bg-slate-900 text-white font-bold rounded-lg">🎨 디자이너 모드</button>
+            </div>
+          </div>
+
+          {/* 의뢰 내용은 시안 등록 여부와 관계없이 항상 보여줍니다. */}
+          <section className="bg-white p-5 rounded-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between border-b pb-3">
+              <h3 className="text-sm font-black text-slate-900">📋 주문 내역</h3>
+              <span className="text-[11px] px-2 py-1 rounded-lg bg-slate-100 text-slate-600">{selectedOrder.itemTypeName || selectedOrder.itemType || '기타'}</span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {[
+                ['접수번호', selectedOrder.orderNumber],
+                ['단체명', selectedOrder.department],
+                ['신청자', selectedOrder.requesterName],
+                ['연락처', selectedOrder.contact],
+                ['완료 희망일', selectedOrder.dueDate],
+                ['진행 상태', STATUS_MAP[selectedOrder.status]?.label || selectedOrder.status]
+              ].map(([label, value]) => (
+                <div key={label} className="bg-slate-50 rounded-xl p-3 min-w-0">
+                  <div className="text-slate-500 mb-1">{label}</div>
+                  <div className="font-bold text-slate-800 break-words">{value || '미입력'}</div>
+                </div>
+              ))}
+            </div>
+            <div className="border rounded-xl p-4 space-y-2">
+              <h4 className="font-bold text-slate-800">제작 사양</h4>
+              <p className="whitespace-pre-wrap break-words text-slate-700">{selectedOrder.summarySpecs || '미입력'}</p>
+              {selectedOrder.specs && Object.keys(selectedOrder.specs).length > 0 && (
+                <dl className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 border-t">
+                  {Object.entries(selectedOrder.specs).map(([key, value]) => (
+                    <div key={key} className="flex gap-2 min-w-0"><dt className="font-bold text-slate-600 shrink-0">{key}</dt><dd className="break-words">{Array.isArray(value) ? value.join(', ') : String(value ?? '')}</dd></div>
+                  ))}
+                </dl>
+              )}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="border rounded-xl p-4 space-y-2">
+                <h4 className="font-bold">디자인 요청사항</h4>
+                <p className="whitespace-pre-wrap break-words">{selectedOrder.requestNotes || '없음'}</p>
+              </div>
+              <div className="border rounded-xl p-4 space-y-2">
+                <h4 className="font-bold">원고 내용</h4>
+                <p className="whitespace-pre-wrap break-words">{selectedOrder.contentNotes || '없음'}</p>
+              </div>
+            </div>
+            <div className="border rounded-xl p-4 space-y-2">
+              <h4 className="font-bold">원고·참고자료 첨부</h4>
+              {selectedOrder.rawFiles?.length ? <FileLinks files={selectedOrder.rawFiles} /> : <p className="text-slate-500">첨부파일 없음</p>}
+            </div>
+            {selectedOrder.itemType !== 'WEB_BANNER' && (
+              <div className="border rounded-xl p-4 space-y-2">
+                <h4 className="font-bold">배송 및 수령 정보</h4>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <p>수령 방법: {selectedOrder.deliveryMethod || '미입력'}</p>
+                  <p>수령자: {selectedOrder.recipientName || '미입력'}</p>
+                  <p>연락처: {selectedOrder.recipientPhone || '미입력'}</p>
+                  <p className="break-words">주소: {selectedOrder.shippingAddress || '미입력'}</p>
+                </div>
+              </div>
+            )}
+          </section>
+
+          <h3 className="text-sm font-black text-slate-900 px-1">🖼️ 시안 및 수정 의견</h3>
+          {drafts.length === 0 ? (
+            <div className="p-12 text-center bg-white rounded-2xl border text-slate-400 font-bold">
+              아직 등록된 시안이 없습니다. 위에서 주문 내역을 확인할 수 있습니다.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              <div className="lg:col-span-8 bg-white p-5 rounded-2xl border space-y-4">
+                <div className="flex justify-between items-center border-b pb-2">
+                  <div className="flex gap-1">
+                    {drafts.map((d) => (
+                      <button
+                        key={d.version}
+                        onClick={() => setSelectedVer(d.version)}
+                        className={`px-3 py-1 rounded-lg font-bold ${selectedVer === d.version ? 'bg-purple-600 text-white' : 'bg-slate-100 text-slate-700'}`}
+                      >
+                        v{d.version}
+                      </button>
+                    ))}
+                  </div>
+                  <button onClick={() => setIsPinMode(!isPinMode)} className={`px-3 py-1 rounded-lg font-bold ${isPinMode ? 'bg-rose-600 text-white' : 'bg-slate-100 text-slate-700'}`}>
+                    📍 {isPinMode ? '핀 모드 종료' : '시안 위에 핀 찍기'}
+                  </button>
+                </div>
+
+                {/* 핀포인트 캔버스 */}
+                <>
+                {curDraft?.storedFile && <FileLinks files={[curDraft.storedFile]} />}
+                <PinpointCanvasWidget
+                  draft={curDraft}
+                  isPinMode={isPinMode}
+                  onSavePins={(pins) => {
+                    const newDrafts = drafts.map((d) => d.version === curDraft.version ? { ...d, pins } : d);
+                    onUpdateOrder({ ...selectedOrder, drafts: newDrafts });
+                  }}
+                /></>
+              </div>
+
+              {/* 우측 피드백 작성 */}
+              <div className="lg:col-span-4 bg-white p-5 rounded-2xl border space-y-4">
+                <h3 className="font-bold text-sm text-slate-900">수정 요청 피드백</h3>
+                <textarea rows="4" placeholder="수정 사항을 입력하세요" value={feedbackText} onChange={(e) => setFeedbackText(e.target.value)} className="w-full border p-2.5 rounded-xl bg-slate-50 resize-none" />
+                <button onClick={handleRequestRevision} className="w-full py-2 bg-rose-600 text-white font-bold rounded-xl">수정 요청 전달</button>
+                <div className="border-t pt-2 space-y-2 max-h-60 overflow-y-auto">
+                  <span className="font-bold text-slate-500 block">피드백 기록:</span>
+                  {(selectedOrder.comments || []).map((c) => (
+                    <div key={c.id} className="p-2 rounded bg-slate-50 border text-[11px]">
+                      <strong>{c.author}:</strong> {c.content}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ==========================================
+    // 9. [서브 컴포넌트] 핀포인트 캔버스 위젯
+    // ==========================================
+    function PinpointCanvasWidget({ draft, isPinMode, onSavePins }) {
+      const containerRef = useRef(null);
+      const [pins, setPins] = useState(draft?.pins || []);
+
+      useEffect(() => {
+        setPins(draft?.pins || []);
+      }, [draft?.pins, draft?.version]);
+
+      const handleCanvasClick = (e) => {
+        if (!isPinMode || !containerRef.current) return;
+        const rect = containerRef.current.getBoundingClientRect();
+        const xPercent = Math.round(((e.clientX - rect.left) / rect.width) * 100);
+        const yPercent = Math.round(((e.clientY - rect.top) / rect.height) * 100);
+        const memo = prompt('이 위치의 수정 메모를 입력하세요:');
+        if (!memo || !memo.trim()) return;
+
+        const newPin = {
+          id: `pin-${Date.now()}`,
+          xPercent,
+          yPercent,
+          comment: memo.trim(),
+          createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        };
+        const updated = [...pins, newPin];
+        setPins(updated);
+        onSavePins(updated);
+      };
+
+      return (
+        <div ref={containerRef} onClick={handleCanvasClick} className={`relative rounded-xl border overflow-hidden select-none ${isPinMode ? 'cursor-crosshair ring-2 ring-rose-500' : ''}`}>
+          <RenderDraftGraphic draft={draft} />
+          {pins.map((p, idx) => (
+            <div
+              key={p.id}
+              style={{ left: `${p.xPercent}%`, top: `${p.yPercent}%` }}
+              className="absolute -translate-x-1/2 -translate-y-1/2 group"
+            >
+              <div className="w-6 h-6 rounded-full bg-rose-600 text-white font-bold flex items-center justify-center text-[11px] shadow-md">
+                {idx + 1}
+              </div>
+              <div className="hidden group-hover:block absolute left-7 top-0 w-48 bg-slate-900 text-white p-2 rounded text-[11px] z-30 shadow-lg">
+                {p.comment}
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // DOM 렌더링
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
