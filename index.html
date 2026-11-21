@@ -1078,6 +1078,11 @@ ${formBody}
       onUpdateOrder,
       triggerToast
     }) {
+      // 미니 게시판 상태 — 완료(출고/배송완료) 건은 기본으로 숨긴다.
+      const [boardQuery, setBoardQuery] = useState('');
+      const [showCompleted, setShowCompleted] = useState(false);
+      const [boardOpen, setBoardOpen] = useState(true);
+
       const [customFile, setCustomFile] = useState(null);
        const [printFile,setPrintFile]=useState(null);
       const [customPreview, setCustomPreview] = useState('');
@@ -1157,6 +1162,17 @@ ${formBody}
 
       if (!selectedOrder) return <div className="p-8 text-center bg-white rounded-xl">선택된 의뢰가 없습니다.</div>;
 
+      // 게시판 목록 계산 — 표시만 걸러내고 선택된 의뢰(selectedOrder)는 그대로 유지한다.
+      const completedCount = orders.filter((o) => o.status === 'SHIPPED').length;
+      const inProgressCount = orders.length - completedCount;
+      const boardQueryText = boardQuery.trim().toLowerCase();
+      const boardOrders = orders.filter((o) => {
+        if (!showCompleted && o.status === 'SHIPPED') return false;
+        if (!boardQueryText) return true;
+        return [o.orderNumber, o.department, o.requesterName]
+          .some((value) => String(value || '').toLowerCase().includes(boardQueryText));
+      });
+
       const nextVer = (selectedOrder.drafts?.length || 0) + 1;
 
       const handleUpload = async (e) => {
@@ -1235,16 +1251,88 @@ ${formBody}
             </div>
           </div>
 
-          <div className="flex gap-2 overflow-x-auto pb-1">
-            {orders.map((o) => (
+          {/* 미니 게시판 — 의뢰를 표로 한눈에 고르고, 완료 건은 기본으로 숨긴다. */}
+          <div className="bg-white rounded-2xl border shadow-sm overflow-hidden">
+            <div className="flex flex-wrap items-center gap-2 p-2.5 border-b bg-slate-50">
               <button
-                key={o.id}
-                onClick={() => onSelectOrderId(o.id)}
-                className={`px-3 py-1.5 rounded-xl font-bold shrink-0 ${selectedOrder.id === o.id ? 'bg-slate-900 text-white' : 'bg-white border text-slate-700'}`}
+                type="button"
+                onClick={() => setBoardOpen((v) => !v)}
+                className="flex items-center gap-1.5 px-2 py-1 rounded-lg font-extrabold text-slate-900 hover:bg-slate-200"
               >
-                [{o.orderNumber}] {o.itemTypeName}
+                <span className="text-[10px] text-slate-500">{boardOpen ? '▼' : '▶'}</span> 주문 게시판
               </button>
-            ))}
+              <span className="text-slate-600 font-bold whitespace-nowrap">
+                전체 {orders.length}건 · 진행 중 {inProgressCount}건
+                {showCompleted ? '' : ` · 완료 ${completedCount}건 숨김`}
+              </span>
+              <label className="flex items-center gap-1.5 px-2 py-1 rounded-lg border bg-white cursor-pointer font-bold text-slate-700 whitespace-nowrap">
+                <input
+                  type="checkbox"
+                  checked={showCompleted}
+                  onChange={(e) => setShowCompleted(e.target.checked)}
+                  className="accent-slate-900"
+                />
+                완료 건 포함
+              </label>
+              <input
+                type="search"
+                value={boardQuery}
+                onChange={(e) => setBoardQuery(e.target.value)}
+                placeholder="주문번호 · 단체명 · 신청자 검색"
+                className="flex-1 min-w-[150px] border rounded-lg px-2.5 py-1 bg-white"
+              />
+            </div>
+            {boardOpen && (
+              <div className="max-h-60 overflow-y-auto overflow-x-auto">
+                <table className="w-full min-w-[620px] text-left border-collapse">
+                  <thead className="bg-slate-100 text-slate-600 sticky top-0 z-10">
+                    <tr>
+                      <th className="px-3 py-2 font-bold whitespace-nowrap">주문번호</th>
+                      <th className="px-3 py-2 font-bold">단체명 / 신청자</th>
+                      <th className="px-3 py-2 font-bold whitespace-nowrap">품목</th>
+                      <th className="px-3 py-2 font-bold whitespace-nowrap">납기일</th>
+                      <th className="px-3 py-2 font-bold whitespace-nowrap">상태</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {boardOrders.map((o) => {
+                      const isSelected = o.id === selectedOrder.id;
+                      return (
+                        <tr
+                          key={o.id}
+                          onClick={() => onSelectOrderId(o.id)}
+                          className={`cursor-pointer border-t ${isSelected ? 'bg-blue-50 text-slate-900 font-bold' : 'text-slate-700 hover:bg-slate-50'}`}
+                        >
+                          <td className="px-3 py-2 whitespace-nowrap">{isSelected ? '▸ ' : ''}[{o.orderNumber}]</td>
+                          <td className="px-3 py-2">
+                            <span className="font-bold">{o.department || '단체명 없음'}</span>
+                            <span className="text-slate-500 font-normal"> / {o.requesterName || '-'}</span>
+                          </td>
+                          <td className="px-3 py-2 whitespace-nowrap">{o.itemTypeName || '-'}</td>
+                          <td className="px-3 py-2 whitespace-nowrap text-rose-600">{o.dueDate || '-'}</td>
+                          <td className="px-3 py-2 whitespace-nowrap">
+                            <span className={`px-1.5 py-0.5 rounded-full border font-bold text-[10px] ${STATUS_MAP[o.status]?.badge || 'bg-slate-100 text-slate-700 border-slate-300'}`}>
+                              {STATUS_MAP[o.status]?.label || o.status}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {boardOrders.length === 0 && (
+                      <tr>
+                        <td colSpan={5} className="px-3 py-6 text-center text-slate-500">
+                          {orders.length === 0
+                            ? '아직 접수된 의뢰가 없습니다.'
+                            : (boardQueryText
+                              ? '검색어에 맞는 의뢰가 없습니다. 검색어를 지우면 전체 목록을 볼 수 있습니다.'
+                              : '진행 중인 의뢰가 없습니다. ‘완료 건 포함’을 켜면 완료된 의뢰까지 볼 수 있습니다.')}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
